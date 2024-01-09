@@ -20,6 +20,14 @@ type RunnerOptions interface {
 	Reload() error
 }
 
+// This function is just some jank to prevent deadlocking if the user doesn't read from warn and it fills up.
+func warning(warn chan<- error, err error) {
+	select {
+	case warn <- err:
+	default:
+	}
+}
+
 type Runner struct {
 	wg       *sync.WaitGroup
 	warn     chan error
@@ -30,22 +38,34 @@ type Runner struct {
 	exitCode int
 }
 
-// This function is just some jank to prevent deadlocking if the user doesn't read from warn and it fills up.
-func warning(warn chan<- error, err error) {
-	select {
-	case warn <- err:
-	default:
-	}
+func NewRunner() *Runner {
+	// First set up signal handling so that we can reload and stop.
+	hups := make(chan os.Signal, 1)
+	stop := make(chan os.Signal, 1)
+
+	signal.Notify(hups, syscall.SIGHUP)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	var waitgroup sync.WaitGroup
+
+	done := make(chan struct{}, 1)
+	err := make(chan error, 1)
+	warn := make(chan error, 10)
+
+	// If exitCode is -1 then execution has not completed yet.
+	server := &Runner{&waitgroup, warn, err, done, stop, hups, -1}
+	return server
 }
 
 func (r *Runner) Warnings() <-chan error {
 	return r.warn
 }
 
-func (r *Runner) ServeWithReload(router http.Handler, opts RunnerOptions, logger *log.Logger) {
+func (r *Runner) serveWithReload(router http.Handler, opts RunnerOptions, logger *log.Logger) {
 	for {
-		if err := opts.Reload(); err != nil {
-			warning(r.warn, fmt.Errorf("Error: failed to refresh server config. May use some old settings."))
+		err := opts.Reload()
+		if err != nil {
+			warning(r.warn, fmt.Errorf("Error reloading server options. Old config may be used: %s", err))
 		}
 
 		addr, err := opts.GetAddr()
@@ -113,15 +133,15 @@ func (r *Runner) ServeWithReload(router http.Handler, opts RunnerOptions, logger
 func (r *Runner) Run(router http.Handler, opts RunnerOptions, logger *log.Logger) {
 	r.wg.Add(1)
 	go r.waitOnInterrupt()
-	go r.ServeWithReload(router, opts, logger)
+	go r.serveWithReload(router, opts, logger)
 	return
 }
 
-func (r *Runner) BlockingRun(router http.Handler, opts RunnerOptions, logger *log.Logger) int {
+func (r *Runner) BlockingRun(router http.Handler, opts RunnerOptions, logger *log.Logger) (int, error) {
 	r.wg.Add(1)
-	go r.ServeWithReload(router, opts, logger)
-	r.waitOnInterrupt()
-	return r.exitCode
+	go r.serveWithReload(router, opts, logger)
+	err := r.waitOnInterrupt()
+	return r.exitCode, err
 }
 
 func (r *Runner) waitOnInterrupt() error {
@@ -151,23 +171,4 @@ func (r *Runner) Shutdown() {
 	close(r.warn)
 	close(r.err)
 	return
-}
-
-func NewRunner(logger *log.Logger) *Runner {
-	// First set up signal handling so that we can reload and stop.
-	hups := make(chan os.Signal, 1)
-	stop := make(chan os.Signal, 1)
-
-	signal.Notify(hups, syscall.SIGHUP)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-
-	var waitgroup sync.WaitGroup
-
-	done := make(chan struct{}, 1)
-	err := make(chan error, 1)
-	warn := make(chan error, 10)
-
-	// If exitCode is -1 then execution has not completed yet.
-	server := &Runner{&waitgroup, warn, err, done, stop, hups, -1}
-	return server
 }
